@@ -193,7 +193,8 @@ impl Client {
 
         req.set_body(Body::from_string(body));
 
-        req.insert_header("content-type", "application/x-www-form-urlencoded");
+        req.insert_header("content-type", "application/json");
+        req.insert_header("stripe-version", "2025-12-15.preview");
         self.client.execute::<T>(req, &self.strategy)
     }
 
