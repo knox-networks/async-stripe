@@ -181,7 +181,7 @@ impl Client {
         url.set_path(&format!("{}/{}", "v2", path.trim_start_matches('/')));
         let mut req = self.create_request(Method::Post, url);
 
-        req.set_body(Body::from_json(form));
+        req.set_body(Body::from_json(&form));
 
         req.insert_header("content-type", "application/json");
         req.insert_header("stripe-version", "2025-12-15.preview");
