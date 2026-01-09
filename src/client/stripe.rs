@@ -181,17 +181,7 @@ impl Client {
         url.set_path(&format!("{}/{}", "v2", path.trim_start_matches('/')));
         let mut req = self.create_request(Method::Post, url);
 
-        let mut params_buffer = Vec::new();
-        let qs_ser = &mut serde_qs::Serializer::new(&mut params_buffer);
-        if let Err(qs_ser_err) = serde_path_to_error::serialize(&form, qs_ser) {
-            return err(StripeError::QueryStringSerialize(qs_ser_err));
-        }
-
-        let body = std::str::from_utf8(params_buffer.as_slice())
-            .expect("Unable to extract string from params_buffer")
-            .to_string();
-
-        req.set_body(Body::from_string(body));
+        req.set_body(Body::from_json(form));
 
         req.insert_header("content-type", "application/json");
         req.insert_header("stripe-version", "2025-12-15.preview");
