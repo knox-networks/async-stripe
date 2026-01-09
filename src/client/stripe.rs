@@ -168,6 +168,35 @@ impl Client {
         self.client.execute::<T>(req, &self.strategy)
     }
 
+    /// Make a `POST` http request with urlencoded body
+    ///
+    /// # Panics
+    /// If the form is not serialized to an utf8 string.
+    pub fn post_form_v2<T: DeserializeOwned + Send + 'static, F: Serialize>(
+        &self,
+        path: &str,
+        form: F,
+    ) -> Response<T> {
+        let mut url = self.api_base.clone();
+        url.set_path(&format!("{}/{}", "v2", path.trim_start_matches('/')));
+        let mut req = self.create_request(Method::Post, url);
+
+        let mut params_buffer = Vec::new();
+        let qs_ser = &mut serde_qs::Serializer::new(&mut params_buffer);
+        if let Err(qs_ser_err) = serde_path_to_error::serialize(&form, qs_ser) {
+            return err(StripeError::QueryStringSerialize(qs_ser_err));
+        }
+
+        let body = std::str::from_utf8(params_buffer.as_slice())
+            .expect("Unable to extract string from params_buffer")
+            .to_string();
+
+        req.set_body(Body::from_string(body));
+
+        req.insert_header("content-type", "application/x-www-form-urlencoded");
+        self.client.execute::<T>(req, &self.strategy)
+    }
+
     fn url(&self, path: &str) -> Url {
         let mut url = self.api_base.clone();
         url.set_path(&format!("{}/{}", self.api_root, path.trim_start_matches('/')));
