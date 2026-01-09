@@ -172,16 +172,20 @@ impl Client {
     ///
     /// # Panics
     /// If the form is not serialized to an utf8 string.
-    pub fn post_form_v2<T: DeserializeOwned + Send + 'static, F: Serialize>(
+    pub fn post_form_v2<T: DeserializeOwned + Send + 'static>(
         &self,
         path: &str,
-        form: F,
+        form: &impl Serialize,
     ) -> Response<T> {
         let mut url = self.api_base.clone();
         url.set_path(&format!("{}/{}", "v2", path.trim_start_matches('/')));
         let mut req = self.create_request(Method::Post, url);
 
-        req.set_body(Body::from_json(&form));
+        let Ok(v) = Body::from_json(form) else {
+            return err(StripeError::Timeout);
+        };
+
+        req.set_body(v);
 
         req.insert_header("content-type", "application/json");
         req.insert_header("stripe-version", "2025-12-15.preview");
