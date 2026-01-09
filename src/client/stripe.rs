@@ -168,6 +168,30 @@ impl Client {
         self.client.execute::<T>(req, &self.strategy)
     }
 
+    /// Make a `POST` http request with urlencoded body
+    ///
+    /// # Panics
+    /// If the form is not serialized to an utf8 string.
+    pub fn post_form_v2<T: DeserializeOwned + Send + 'static>(
+        &self,
+        path: &str,
+        form: &impl Serialize,
+    ) -> Response<T> {
+        let mut url = self.api_base.clone();
+        url.set_path(&format!("{}/{}", "v2", path.trim_start_matches('/')));
+        let mut req = self.create_request(Method::Post, url);
+
+        let Ok(v) = Body::from_json(form) else {
+            return err(StripeError::Timeout);
+        };
+
+        req.set_body(v);
+
+        req.insert_header("content-type", "application/json");
+        req.insert_header("stripe-version", "2025-12-15.preview");
+        self.client.execute::<T>(req, &self.strategy)
+    }
+
     fn url(&self, path: &str) -> Url {
         let mut url = self.api_base.clone();
         url.set_path(&format!("{}/{}", self.api_root, path.trim_start_matches('/')));
