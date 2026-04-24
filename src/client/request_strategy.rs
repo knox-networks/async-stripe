@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use http_types::StatusCode;
+use http::StatusCode;
 
 #[derive(Clone, Debug)]
 pub enum RequestStrategy {

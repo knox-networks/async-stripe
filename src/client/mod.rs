@@ -1,5 +1,8 @@
+mod request;
 mod request_strategy;
 mod stripe;
+
+pub(crate) use request::StripeRequest;
 
 mod base {
     #[cfg(any(
@@ -11,9 +14,6 @@ mod base {
         feature = "runtime-blocking-rustls-webpki",
     ))]
     pub mod tokio;
-
-    #[cfg(feature = "runtime-async-std-surf")]
-    pub mod async_std;
 
     #[cfg(any(
         feature = "runtime-blocking",
@@ -41,12 +41,6 @@ pub(crate) mod config {
 pub(crate) mod config {
     pub(crate) use super::base::tokio::{err, ok};
     pub use super::base::tokio::{Response, TokioClient as BaseClient};
-}
-
-#[cfg(feature = "runtime-async-std-surf")]
-pub(crate) mod config {
-    pub(crate) use super::base::async_std::{err, ok};
-    pub use super::base::async_std::{AsyncStdClient as BaseClient, Response};
 }
 
 pub use config::BaseClient;
