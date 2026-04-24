@@ -1,10 +1,10 @@
 use std::{sync::Arc, time::Duration};
 
-use http_types::Request;
 use serde::de::DeserializeOwned;
 
 use crate::client::base::tokio::TokioClient;
 use crate::client::request_strategy::RequestStrategy;
+use crate::client::StripeRequest;
 use crate::error::StripeError;
 
 /// The delay after which the blocking `Client` will assume the request has failed.
@@ -51,7 +51,7 @@ impl TokioBlockingClient {
 
     pub fn execute<T: DeserializeOwned + Send + 'static>(
         &self,
-        request: Request,
+        request: StripeRequest,
         strategy: &RequestStrategy,
     ) -> Response<T> {
         let future = self.inner.execute(request, strategy);

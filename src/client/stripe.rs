@@ -1,8 +1,9 @@
-use http_types::{Body, Method, Request, Url};
+use http::Method;
 use serde::{de::DeserializeOwned, Serialize};
+use url::Url;
 
 use crate::{
-    client::{request_strategy::RequestStrategy, BaseClient, Response},
+    client::{request_strategy::RequestStrategy, BaseClient, Response, StripeRequest},
     config::err,
     generated::core::version::VERSION,
     params::AppInfo,
@@ -99,7 +100,7 @@ impl Client {
     /// Make a `GET` http request with just a path
     pub fn get<T: DeserializeOwned + Send + 'static>(&self, path: &str) -> Response<T> {
         let url = self.url(path);
-        self.client.execute::<T>(self.create_request(Method::Get, url), &self.strategy)
+        self.client.execute::<T>(self.create_request(Method::GET, url), &self.strategy)
     }
 
     /// Make a `GET` http request with url query parameters
@@ -112,13 +113,13 @@ impl Client {
             Err(e) => return err(e),
             Ok(ok) => ok,
         };
-        self.client.execute::<T>(self.create_request(Method::Get, url), &self.strategy)
+        self.client.execute::<T>(self.create_request(Method::GET, url), &self.strategy)
     }
 
     /// Make a `DELETE` http request with just a path
     pub fn delete<T: DeserializeOwned + Send + 'static>(&self, path: &str) -> Response<T> {
         let url = self.url(path);
-        self.client.execute::<T>(self.create_request(Method::Delete, url), &self.strategy)
+        self.client.execute::<T>(self.create_request(Method::DELETE, url), &self.strategy)
     }
 
     /// Make a `DELETE` http request with url query parameters
@@ -131,13 +132,13 @@ impl Client {
             Err(e) => return err(e),
             Ok(ok) => ok,
         };
-        self.client.execute::<T>(self.create_request(Method::Delete, url), &self.strategy)
+        self.client.execute::<T>(self.create_request(Method::DELETE, url), &self.strategy)
     }
 
     /// Make a `POST` http request with just a path
     pub fn post<T: DeserializeOwned + Send + 'static>(&self, path: &str) -> Response<T> {
         let url = self.url(path);
-        self.client.execute::<T>(self.create_request(Method::Post, url), &self.strategy)
+        self.client.execute::<T>(self.create_request(Method::POST, url), &self.strategy)
     }
 
     /// Make a `POST` http request with urlencoded body
@@ -150,7 +151,7 @@ impl Client {
         form: F,
     ) -> Response<T> {
         let url = self.url(path);
-        let mut req = self.create_request(Method::Post, url);
+        let mut req = self.create_request(Method::POST, url);
 
         let mut params_buffer = Vec::new();
         let qs_ser = &mut serde_qs::Serializer::new(&mut params_buffer);
@@ -162,13 +163,12 @@ impl Client {
             .expect("Unable to extract string from params_buffer")
             .to_string();
 
-        req.set_body(Body::from_string(body));
-
+        req.set_body(body.into_bytes());
         req.insert_header("content-type", "application/x-www-form-urlencoded");
         self.client.execute::<T>(req, &self.strategy)
     }
 
-    /// Make a `POST` http request with urlencoded body
+    /// Make a `POST` http request with json body
     ///
     /// # Panics
     /// If the form is not serialized to an utf8 string.
@@ -179,14 +179,14 @@ impl Client {
     ) -> Response<T> {
         let mut url = self.api_base.clone();
         url.set_path(&format!("{}/{}", "v2", path.trim_start_matches('/')));
-        let mut req = self.create_request(Method::Post, url);
+        let mut req = self.create_request(Method::POST, url);
 
-        let Ok(v) = Body::from_json(form) else {
-            return err(StripeError::Timeout);
+        let body = match serde_json::to_vec(form) {
+            Ok(b) => b,
+            Err(_) => return err(StripeError::Timeout),
         };
 
-        req.set_body(v);
-
+        req.set_body(body);
         req.insert_header("content-type", "application/json");
         req.insert_header("stripe-version", "2025-12-15.preview");
         self.client.execute::<T>(req, &self.strategy)
@@ -213,8 +213,8 @@ impl Client {
         Ok(url)
     }
 
-    fn create_request(&self, method: Method, url: Url) -> Request {
-        let mut req = Request::new(method, url);
+    fn create_request(&self, method: Method, url: Url) -> StripeRequest {
+        let mut req = StripeRequest::new(method, url);
         req.insert_header("authorization", format!("Bearer {}", self.secret_key));
 
         for (key, value) in self.headers.to_array().iter().filter_map(|(k, v)| v.map(|v| (*k, v))) {

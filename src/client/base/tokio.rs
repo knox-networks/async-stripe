@@ -1,24 +1,27 @@
 use std::future::{self, Future};
 use std::pin::Pin;
 
-use http_types::{Request, StatusCode};
-use hyper::http;
-use hyper::{client::HttpConnector, Body};
+use http::StatusCode;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
+use hyper_util::client::legacy::connect::HttpConnector;
 use serde::de::DeserializeOwned;
 use tokio::time::sleep;
 
 use crate::client::request_strategy::{Outcome, RequestStrategy};
+use crate::client::StripeRequest;
 use crate::error::{ErrorResponse, StripeError};
 
 #[cfg(feature = "hyper-rustls-native")]
 mod connector {
-    use hyper::client::{connect::dns::GaiResolver, HttpConnector};
-    pub use hyper_rustls::HttpsConnector;
     use hyper_rustls::HttpsConnectorBuilder;
+    use hyper_util::client::legacy::connect::HttpConnector;
+    pub use hyper_rustls::HttpsConnector;
 
-    pub fn create() -> HttpsConnector<HttpConnector<GaiResolver>> {
+    pub fn create() -> HttpsConnector<HttpConnector> {
         HttpsConnectorBuilder::new()
             .with_native_roots()
+            .expect("Failed to load native TLS certificates")
             .https_or_http()
             .enable_http1()
             .enable_http2()
@@ -28,11 +31,11 @@ mod connector {
 
 #[cfg(feature = "hyper-rustls-webpki")]
 mod connector {
-    use hyper::client::{connect::dns::GaiResolver, HttpConnector};
-    pub use hyper_rustls::HttpsConnector;
     use hyper_rustls::HttpsConnectorBuilder;
+    use hyper_util::client::legacy::connect::HttpConnector;
+    pub use hyper_rustls::HttpsConnector;
 
-    pub fn create() -> HttpsConnector<HttpConnector<GaiResolver>> {
+    pub fn create() -> HttpsConnector<HttpConnector> {
         HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
@@ -44,10 +47,10 @@ mod connector {
 
 #[cfg(feature = "hyper-tls")]
 mod connector {
-    use hyper::client::{connect::dns::GaiResolver, HttpConnector};
+    use hyper_util::client::legacy::connect::HttpConnector;
     pub use hyper_tls::HttpsConnector;
 
-    pub fn create() -> HttpsConnector<HttpConnector<GaiResolver>> {
+    pub fn create() -> HttpsConnector<HttpConnector> {
         HttpsConnector::new()
     }
 }
@@ -55,7 +58,8 @@ mod connector {
 #[cfg(all(feature = "hyper-tls", feature = "hyper-rustls"))]
 compile_error!("You must enable only one TLS implementation");
 
-type HttpClient = hyper::Client<connector::HttpsConnector<HttpConnector>, Body>;
+type HttpClient =
+    hyper_util::client::legacy::Client<connector::HttpsConnector<HttpConnector>, Full<Bytes>>;
 
 pub type Response<T> = Pin<Box<dyn Future<Output = Result<T, StripeError>> + Send>>;
 
@@ -85,13 +89,17 @@ impl Default for TokioClient {
 impl TokioClient {
     pub fn new() -> Self {
         Self {
-            client: hyper::Client::builder().pool_max_idle_per_host(0).build(connector::create()),
+            client: hyper_util::client::legacy::Client::builder(
+                hyper_util::rt::TokioExecutor::new(),
+            )
+            .pool_max_idle_per_host(0)
+            .build(connector::create()),
         }
     }
 
     pub fn execute<T: DeserializeOwned + Send + 'static>(
         &self,
-        request: Request,
+        request: StripeRequest,
         strategy: &RequestStrategy,
     ) -> Response<T> {
         // need to clone here since client could be used across threads.
@@ -109,9 +117,9 @@ impl TokioClient {
 
 async fn send_inner(
     client: &HttpClient,
-    mut request: Request,
+    mut request: StripeRequest,
     strategy: &RequestStrategy,
-) -> Result<hyper::body::Bytes, StripeError> {
+) -> Result<Bytes, StripeError> {
     let mut tries = 0;
     let mut last_status: Option<StatusCode> = None;
     let mut last_retry_header: Option<bool> = None;
@@ -123,8 +131,6 @@ async fn send_inner(
         request.insert_header("Idempotency-Key", key);
     }
 
-    let body = request.body_bytes().await?;
-
     loop {
         return match strategy.test(last_status, last_retry_header, tries) {
             Outcome::Stop => Err(last_error),
@@ -133,16 +139,12 @@ async fn send_inner(
                     sleep(duration).await;
                 }
 
-                // note: http::Request provides no easy way to clone, so we perform
-                //       the conversion from the clonable http_types::Request each time
-                //       obviously cloning before the first request is not ideal
-                let mut request = request.clone();
-                request.set_body(body.clone());
-
-                let response = match client.request(convert_request(request).await).await {
+                // StripeRequest is Clone and already holds the body as Vec<u8>,
+                // so we simply clone it for each attempt.
+                let response = match client.request(convert_request(request.clone())).await {
                     Ok(response) => response,
                     Err(err) => {
-                        last_error = StripeError::from(err);
+                        last_error = StripeError::ClientError(err.to_string());
                         tries += 1;
                         continue;
                     }
@@ -155,23 +157,19 @@ async fn send_inner(
                     .and_then(|s| s.to_str().ok())
                     .and_then(|s| s.parse().ok());
 
-                let bytes = hyper::body::to_bytes(response.into_body()).await?;
+                let bytes = response.into_body().collect().await?.to_bytes();
 
                 if !status.is_success() {
                     tries += 1;
                     let json_deserializer = &mut serde_json::Deserializer::from_slice(&bytes);
                     last_error = serde_path_to_error::deserialize(json_deserializer)
                         .map(|mut e: ErrorResponse| {
-                            e.error.http_status = status.into();
+                            e.error.http_status = status.as_u16();
                             StripeError::from(e.error)
                         })
                         .unwrap_or_else(StripeError::from);
-                    last_status = Some(
-                        // NOTE: StatusCode::from can panic here, so fall back to InternalServerError
-                        //       see https://github.com/http-rs/http-types/blob/ac5d645ce5294554b86ebd49233d3ec01665d1d7/src/hyperium_http.rs#L20-L24
-                        StatusCode::try_from(u16::from(status))
-                            .unwrap_or(StatusCode::InternalServerError),
-                    );
+                    // status is already http::StatusCode (same crate as our dep)
+                    last_status = Some(status);
                     last_retry_header = retry;
                     continue;
                 }
@@ -182,25 +180,29 @@ async fn send_inner(
     }
 }
 
-/// convert an http_types::Request with a http_types::Body into a http::Request<hyper::Body>
-///
-/// note: this is necesarry because `http` deliberately does not support a `Body` type
-///       so hyper has a `Body` for which http_types cannot provide automatic conversion.
-async fn convert_request(mut request: http_types::Request) -> http::Request<hyper::Body> {
-    let body = request.body_bytes().await.expect("We know the data is a valid bytes object.");
-    let request: http::Request<_> = request.into();
-    http::Request::from_parts(request.into_parts().0, hyper::Body::from(body))
+/// Convert a `StripeRequest` into a `hyper::Request<Full<Bytes>>`.
+fn convert_request(request: StripeRequest) -> hyper::Request<Full<Bytes>> {
+    let mut builder =
+        hyper::Request::builder().method(request.method).uri(request.url.as_str());
+    for (name, value) in &request.headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    builder.body(Full::new(Bytes::from(request.body))).expect("valid request parts")
 }
 
 #[cfg(test)]
 mod tests {
-    use http_types::{Method, Request, Url};
+    use http_body_util::{BodyExt, Full};
+    use http::Method;
+    use hyper::body::Bytes;
+    use hyper::Request as HyperRequest;
     use httpmock::prelude::*;
-    use hyper::{body::to_bytes, Body, Request as HyperRequest};
+    use url::Url;
 
     use super::convert_request;
     use super::TokioClient;
     use crate::client::request_strategy::RequestStrategy;
+    use crate::client::StripeRequest;
     use crate::StripeError;
 
     const TEST_URL: &str = "https://api.stripe.com/v1/";
@@ -208,11 +210,11 @@ mod tests {
     #[tokio::test]
     async fn basic_conversion() {
         req_equal(
-            convert_request(Request::new(Method::Get, TEST_URL)).await,
+            convert_request(StripeRequest::new(Method::GET, Url::parse(TEST_URL).unwrap())),
             HyperRequest::builder()
                 .method("GET")
                 .uri("http://test.com")
-                .body(Body::empty())
+                .body(Full::new(Bytes::new()))
                 .unwrap(),
         )
         .await;
@@ -220,14 +222,18 @@ mod tests {
 
     #[tokio::test]
     async fn bytes_body_conversion() {
-        let body = "test".as_bytes();
+        let body = b"test";
 
-        let mut req = Request::new(Method::Post, TEST_URL);
-        req.set_body(body);
+        let mut req = StripeRequest::new(Method::POST, Url::parse(TEST_URL).unwrap());
+        req.set_body(body.to_vec());
 
         req_equal(
-            convert_request(req).await,
-            HyperRequest::builder().method("POST").uri(TEST_URL).body(Body::from(body)).unwrap(),
+            convert_request(req),
+            HyperRequest::builder()
+                .method("POST")
+                .uri(TEST_URL)
+                .body(Full::new(Bytes::from_static(body)))
+                .unwrap(),
         )
         .await;
     }
@@ -236,22 +242,29 @@ mod tests {
     async fn string_body_conversion() {
         let body = "test";
 
-        let mut req = Request::new(Method::Post, TEST_URL);
-        req.set_body(body);
+        let mut req = StripeRequest::new(Method::POST, Url::parse(TEST_URL).unwrap());
+        req.set_body(body.as_bytes().to_vec());
 
         req_equal(
-            convert_request(req).await,
-            HyperRequest::builder().method("POST").uri(TEST_URL).body(Body::from(body)).unwrap(),
+            convert_request(req),
+            HyperRequest::builder()
+                .method("POST")
+                .uri(TEST_URL)
+                .body(Full::new(Bytes::from(body)))
+                .unwrap(),
         )
         .await;
     }
 
-    async fn req_equal(a: HyperRequest<Body>, b: HyperRequest<Body>) {
+    async fn req_equal(a: HyperRequest<Full<Bytes>>, b: HyperRequest<Full<Bytes>>) {
         let (a_parts, a_body) = a.into_parts();
         let (b_parts, b_body) = b.into_parts();
 
         assert_eq!(a_parts.method, b_parts.method);
-        assert_eq!(to_bytes(a_body).await.unwrap().len(), to_bytes(b_body).await.unwrap().len());
+        assert_eq!(
+            a_body.collect().await.unwrap().to_bytes().len(),
+            b_body.collect().await.unwrap().to_bytes().len()
+        );
     }
 
     #[tokio::test]
@@ -267,7 +280,7 @@ mod tests {
             then.status(500);
         });
 
-        let req = Request::get(Url::parse(&server.url("/server-errors")).unwrap());
+        let req = StripeRequest::new(Method::GET, Url::parse(&server.url("/server-errors")).unwrap());
         let res = client.execute::<()>(req, &RequestStrategy::Retry(5)).await;
 
         hello_mock.assert_hits_async(5).await;
@@ -292,7 +305,7 @@ mod tests {
               ");
         });
 
-        let req = Request::get(Url::parse(&server.url("/v1/missing")).unwrap());
+        let req = StripeRequest::new(Method::GET, Url::parse(&server.url("/v1/missing")).unwrap());
         let res = client.execute::<()>(req, &RequestStrategy::Retry(3)).await;
 
         mock.assert_hits_async(1).await;
@@ -332,7 +345,7 @@ mod tests {
             );
         });
 
-        let req = Request::get(Url::parse(&server.url("/v1/odd_data")).unwrap());
+        let req = StripeRequest::new(Method::GET, Url::parse(&server.url("/v1/odd_data")).unwrap());
         let res = client.execute::<DataType>(req, &RequestStrategy::Retry(3)).await;
 
         mock.assert_hits_async(1).await;
@@ -358,7 +371,7 @@ mod tests {
             then.status(500).header("Stripe-Should-Retry", "false");
         });
 
-        let req = Request::get(Url::parse(&server.url("/server-errors")).unwrap());
+        let req = StripeRequest::new(Method::GET, Url::parse(&server.url("/server-errors")).unwrap());
         let res = client.execute::<()>(req, &RequestStrategy::Retry(5)).await;
 
         hello_mock.assert_hits_async(1).await;
@@ -378,8 +391,8 @@ mod tests {
             then.status(500);
         });
 
-        let mut req = Request::post(Url::parse(&server.url("/server-errors")).unwrap());
-        req.set_body("body");
+        let mut req = StripeRequest::new(Method::POST, Url::parse(&server.url("/server-errors")).unwrap());
+        req.set_body(b"body".to_vec());
         let res = client.execute::<()>(req, &RequestStrategy::Retry(5)).await;
 
         hello_mock.assert_hits_async(5).await;
